@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>WebRTC Call (Express + Socket.IO)</title>
+  <style>
+    body { font-family: system-ui, Arial; padding: 16px; }
+    .row { margin-bottom: 12px; }
+    video { width: 320px; height: 240px; background:#000; margin-right: 8px; }
+    input { padding: 8px; width: 220px; }
+    button { padding: 8px 12px; margin-right: 8px; }
+    .status { margin-top: 8px; font-size: 14px; color: #444; }
+  </style>
+  <script src="/socket.io/socket.io.js"></script>
+</head>
+<body>
+  <h2>WebRTC Video Call</h2>
+
+  <div class="row">
+    <input id="roomId" placeholder="Enter or generate Room ID" />
+    <button id="genId">Generate</button>
+    <button id="join">Join</button>
+    <button id="leave" disabled>Leave</button>
+  </div>
+
+  <div class="row">
+    <button id="startCall" disabled>Start Call (caller)</button>
+    <span class="status" id="status">Idle</span>
+  </div>
+
+  <div class="row">
+    <video id="local" autoplay playsinline muted></video>
+    <video id="remote" autoplay playsinline></video>
+  </div>
+
+<script>
+(() => {
+  // ---- Config ----
+  const ICE_SERVERS = [
+    { urls: "stun:stun.l.google.com:19302" }
+    // For production, add a TURN server (coturn) e.g.:
+    // { urls: "turn:your.turn.server:3478", username: "user", credential: "pass" }
+  ];
+
+  // ---- State ----
+  const socket = io();
+  let roomId = null;
+  let pc = null;
+  let localStream = null;
+  let remoteStream = null;
+  let joined = false;
+
+  // Track peers (socketId -> RTCPeerConnection) to support >2 users later.
+  // For 1:1, we’ll use the single `pc`. This map shows how to go multi-peer.
+  const peerConnections = new Map();
+
+  // ---- UI elements ----
+  const $room = document.getElementById("roomId");
+  const $gen = document.getElementById("genId");
+  const $join = document.getElementById("join");
+  const $leave = document.getElementById("leave");
+  const $start = document.getElementById("startCall");
+  const $status = document.getElementById("status");
+  
+  const $local = document.getElementById("local");
+  const $remote = document.getElementById("remote");
+
+  const setStatus = (t) => $status.textContent = t;
+
+  // ---- Helpers ----
+  function newPeerConnection() {
+    const conn = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+
+    conn.onicecandidate = (e) => {
+      if (e.candidate && roomId) {
+        socket.emit("signal", {
+          roomId,
+          // If doing multi-peer, send to specific remoteId.
+          // Here we broadcast and let the other peer pick it up.
+          to: null,
+          data: { type: "candidate", candidate: e.candidate }
+        });
+      }
+    };
+
+    conn.ontrack = (e) => {
+      if (!remoteStream) {
+        remoteStream = new MediaStream();
+        $remote.srcObject = remoteStream;
+      }
+      remoteStream.addTrack(e.track);
+    };
+
+    return conn;
+  }
+
+  async function ensureLocalStream() {
+    if (!localStream) {
+      localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      $local.srcObject = localStream;
+    }
+    return localStream;
+  }
+
+  // ---- Socket events ----
+  socket.on("peers-in-room", async ({ peers }) => {
+    setStatus(`Joined room. Peers here: ${peers.length}`);
+    // For 1:1 we don't auto-call. Caller presses Start Call.
+    // If you want auto-answer: do nothing here.
+  });
+
+  socket.on("peer-joined", ({ socketId }) => {
+    setStatus(`Peer joined: ${socketId}. Click "Start Call" to call.`);
+  });
+
+  socket.on("peer-left", ({ socketId }) => {
+    setStatus(`Peer left: ${socketId}`);
+    // Close per-peer connection if using multi-peer map
+    if (peerConnections.has(socketId)) {
+      peerConnections.get(socketId).close();
+      peerConnections.delete(socketId);
+    }
+  });
+
+  socket.on("signal", async ({ from, data }) => {
+    if (!pc) pc = newPeerConnection();
+
+    if (data.type === "offer") {
+      await ensureLocalStream();
+      localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+      await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      socket.emit("signal", { roomId, to: from, data: { type: "answer", answer } });
+      setStatus("Answer sent.");
+    } else if (data.type === "answer") {
+      // Only set if we’re in have-local-offer (avoid stable-state error)
+      if (!pc.currentRemoteDescription) {
+        await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+        setStatus("Answer received. Connecting…");
+      }
+    } else if (data.type === "candidate") {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+      } catch (err) {
+        console.warn("Error adding ICE candidate", err);
+      }
+    }
+  });
+
+  // ---- UI handlers ----
+  $gen.onclick = () => {
+    $room.value = crypto.randomUUID().slice(0, 8);
+  };
+
+  $join.onclick = async () => {
+    if (!$room.value) return alert("Enter or generate a Room ID first.");
+    roomId = $room.value.trim();
+    socket.emit("join", { roomId });
+    joined = true;
+    $join.disabled = true;
+    $leave.disabled = false;
+    $start.disabled = false;
+    setStatus(`Joined room ${roomId}. Share this ID with your peer.`);
+    // Pre-warm local media (optional)
+    await ensureLocalStream();
+  };
+
+  $leave.onclick = () => {
+    if (!joined) return;
+    socket.emit("leave", { roomId });
+    joined = false;
+    $join.disabled = false;
+    $leave.disabled = true;
+    $start.disabled = true;
+    setStatus("Left room.");
+    // Cleanup
+    if (pc) { pc.close(); pc = null; }
+    if (remoteStream) {
+      remoteStream.getTracks().forEach(t => t.stop());
+      remoteStream = null;
+      $remote.srcObject = null;
+    }
+  };
+
+  // Caller presses this to create & send the offer
+  $start.onclick = async () => {
+    if (!joined) return alert("Join a room first.");
+    await ensureLocalStream();
+    if (!pc) pc = newPeerConnection();
+    // Attach tracks once (avoid duplicates)
+    const senders = pc.getSenders();
+    if (senders.length === 0) {
+      localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+    }
+    const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+    await pc.setLocalDescription(offer);
+    socket.emit("signal", { roomId, to: null, data: { type: "offer", offer } });
+    setStatus("Offer sent. Waiting for answer…");
+  };
+
+  // Optional: warn if not using HTTPS (WebRTC mic/cam usually require secure origin)
+  if (location.protocol !== "https:" && location.hostname !== "localhost") {
+    setStatus("Warning: Use HTTPS in production for camera/mic permissions and better reliability.");
+  }
+})();
+</script>
+</body>
+</html>
