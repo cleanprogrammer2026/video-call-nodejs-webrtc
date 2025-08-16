@@ -37,9 +37,14 @@
 (() => {
   // ---- Config ----
   const ICE_SERVERS = [
-    { urls: "stun:stun.l.google.com:19302" }
+    { urls: "stun:stun.l.google.com:19302" },
     // For production, add a TURN server (coturn) e.g.:
     // { urls: "turn:your.turn.server:3478", username: "user", credential: "pass" }
+    { 
+      urls: "turn:peer.agregartech.com:3478?transport=udp",
+      username: "webrtcuser",
+      credential: "webrtcuser"
+    }
   ];
 
   // ---- State ----
